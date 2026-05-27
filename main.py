@@ -8,6 +8,7 @@ One QBO P&L export → one row in the sheet.
 
 from __future__ import annotations
 
+import calendar
 import logging
 import os
 import re
@@ -93,22 +94,77 @@ def parse(file_bytes: bytes) -> dict:
     return result
 
 
-_PERIOD_RE = re.compile(r"-\s*([A-Za-z]+ \d+,?\s*\d{4})\s*$")
+_MONTHS = (r"(?:January|February|March|April|May|June|"
+           r"July|August|September|October|November|December)")
 
 
 def _find_report_end_date(rows: list) -> Optional[str]:
-    """Pull end date from header (e.g. 'May 1, 2025-May 27, 2026' → '05/27/2026')."""
+    """Pull end date from QBO header, handling multiple formats:
+        'May 1, 2025-May 27, 2026'        -> 05/27/2026
+        'January 1 - December 31, 2025'   -> 12/31/2025
+        'January 1-31, 2025'              -> 01/31/2025
+        'January 2026'                    -> 01/31/2026
+        '2025'                            -> 12/31/2025
+        '1/1/2025-12/31/2025'             -> 12/31/2025
+    """
     for i in range(min(10, len(rows))):
         if not rows[i] or rows[i][0] is None:
             continue
-        m = _PERIOD_RE.search(str(rows[i][0]))
-        if not m:
-            continue
+        text = str(rows[i][0]).strip()
+        result = _parse_period_string(text)
+        if result:
+            return result
+    return None
+
+
+def _parse_period_string(text: str) -> Optional[str]:
+    # 1. "...-Month Day, Year" (any range ending with full month/day/year)
+    m = re.search(rf"-\s*({_MONTHS})\s+(\d+),?\s*(\d{{4}})\s*$", text)
+    if m:
         try:
-            dt = datetime.strptime(m.group(1).replace(",", ""), "%B %d %Y")
-            return dt.strftime("%m/%d/%Y")
+            return datetime.strptime(
+                f"{m.group(1)} {m.group(2)} {m.group(3)}", "%B %d %Y"
+            ).strftime("%m/%d/%Y")
         except ValueError:
-            continue
+            pass
+
+    # 2. "Month Day-Day, Year" (same-month range like "January 1-31, 2025")
+    m = re.search(
+        rf"({_MONTHS})\s+\d+\s*-\s*(\d+),?\s*(\d{{4}})\s*$", text
+    )
+    if m:
+        try:
+            return datetime.strptime(
+                f"{m.group(1)} {m.group(2)} {m.group(3)}", "%B %d %Y"
+            ).strftime("%m/%d/%Y")
+        except ValueError:
+            pass
+
+    # 3. "Month Year" (single month like "January 2026") -> last day of month
+    m = re.match(rf"^({_MONTHS})\s+(\d{{4}})\s*$", text)
+    if m:
+        try:
+            dt = datetime.strptime(f"{m.group(1)} 1 {m.group(2)}", "%B %d %Y")
+            last_day = calendar.monthrange(dt.year, dt.month)[1]
+            return dt.replace(day=last_day).strftime("%m/%d/%Y")
+        except ValueError:
+            pass
+
+    # 4. "MM/DD/YYYY-MM/DD/YYYY" (numeric range) -> end date
+    m = re.search(r"-\s*(\d{1,2})/(\d{1,2})/(\d{4})\s*$", text)
+    if m:
+        try:
+            return datetime.strptime(
+                f"{m.group(1)}/{m.group(2)}/{m.group(3)}", "%m/%d/%Y"
+            ).strftime("%m/%d/%Y")
+        except ValueError:
+            pass
+
+    # 5. "YYYY" alone -> Dec 31 of that year
+    m = re.match(r"^(\d{4})\s*$", text)
+    if m:
+        return f"12/31/{m.group(1)}"
+
     return None
 
 
